@@ -1,0 +1,20 @@
+services:
+  - type: web
+    name: profilebackend
+    env: node
+    buildCommand: npm install
+    startCommand: npm start
+    plan: free
+    envVars:
+      - key: BOT_TOKEN
+        sync: false          # Set manually in Render dashboard
+      - key: MONGO_URI
+        sync: false          # Set manually in Render dashboard
+      - key: OWNER_TELEGRAM_ID
+        sync: false          # Set manually in Render dashboard
+      - key: ADMIN_TOKEN
+        sync: false          # Set manually in Render dashboard
+      - key: FRONTEND_URL
+        sync: false          # Set manually in Render dashboard
+      - key: NODE_ENV
+        value: production

@@ -2,54 +2,134 @@
  * profilebackend — server.js
  * Rowan Elliss Portfolio Backend
  * Stack : Node.js · Express · MongoDB (Mongoose) · Telegraf · node-cron
+ *
+ * ─────────────────────────────────────────────────────────────────────
+ *  .env / Render Environment Variables Setup Guide
+ * ─────────────────────────────────────────────────────────────────────
+ *  BOT_TOKEN           = Telegram Bot token from @BotFather
+ *                        Example: 1234567890:ABCdefGHIjklMNOpqrSTUvwxYZ
+ *
+ *  OWNER_TELEGRAM_ID   = Your personal Telegram numeric ID
+ *  (or ADMIN_ID)         Get it from @userinfobot — open Telegram,
+ *                        search @userinfobot, press START, it sends your ID.
+ *                        Example: 123456789
+ *                        ⚠️  Must be a NUMBER, NOT a username (@handle)
+ *
+ *  MONGO_URI           = MongoDB Atlas connection string
+ *                        mongodb+srv://user:pass@cluster.mongodb.net/portfolio
+ *
+ *  ADMIN_TOKEN         = Random secret for /api/visitors and /api/stats
+ *                        Generate: node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
+ *
+ *  SELF_URL            = Your Render service URL (for keep-alive cron)
+ *                        Example: https://profilebackend-5mwr.onrender.com
+ *
+ *  PORT                = 3000 (Render sets this automatically)
+ * ─────────────────────────────────────────────────────────────────────
  */
 
 require('dotenv').config();
 
-const express     = require('express');
-const mongoose    = require('mongoose');
-const cors        = require('cors');
-const cron        = require('node-cron');
-const axios       = require('axios');
+const express      = require('express');
+const mongoose     = require('mongoose');
+const cors         = require('cors');
+const cron         = require('node-cron');
+const axios        = require('axios');
 const { Telegraf } = require('telegraf');
 
 const Visitor = require('./models/Visitor');
 
-// ─── App ────────────────────────────────────────────────────
-const app  = express();
-const PORT = process.env.PORT || 3000;
+// ─── Validate critical env vars ────────────────────────────────────────
+const BOT_TOKEN  = process.env.BOT_TOKEN;
+const OWNER_ID   = process.env.OWNER_TELEGRAM_ID || process.env.ADMIN_ID; // support both names
+const MONGO_URI  = process.env.MONGO_URI;
+const ADMIN_TKN  = process.env.ADMIN_TOKEN;
+const SELF_URL   = process.env.SELF_URL || 'https://profilebackend-5mwr.onrender.com';
+const PORT       = process.env.PORT || 3000;
 
-// ─── CORS ────────────────────────────────────────────────────
-// Allow ALL origins (Vercel static site, Telegram WebApp, etc.)
+if (!BOT_TOKEN) {
+  console.error('❌ FATAL: BOT_TOKEN is not set in .env');
+  process.exit(1);
+}
+if (!OWNER_ID) {
+  console.error('❌ FATAL: OWNER_TELEGRAM_ID (or ADMIN_ID) is not set in .env');
+  console.error('   Get your Telegram ID from @userinfobot — it looks like: 123456789');
+  process.exit(1);
+}
+if (!MONGO_URI) {
+  console.error('❌ FATAL: MONGO_URI is not set in .env');
+  process.exit(1);
+}
+
+console.log(`✅ Config OK — Owner ID: ${OWNER_ID}`);
+
+// ─── App ────────────────────────────────────────────────────────────────
+const app = express();
+
+// ─── CORS ───────────────────────────────────────────────────────────────
+// Allow ALL origins (Vercel static site, Telegram WebApp, browsers, etc.)
 app.use(cors({
   origin: '*',
   methods: ['GET', 'POST', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With'],
 }));
 app.options('*', cors()); // pre-flight for ALL routes
 
-// ─── Body parser ─────────────────────────────────────────────
+// ─── Body parser ────────────────────────────────────────────────────────
 app.use(express.json({ limit: '1mb' }));
 app.use(express.urlencoded({ extended: true }));
 
-// ─── Telegram Bot ─────────────────────────────────────────────
-const bot = new Telegraf(process.env.BOT_TOKEN);
+// ─── Telegram Bot ───────────────────────────────────────────────────────
+let bot;
+try {
+  bot = new Telegraf(BOT_TOKEN);
 
-bot.start(ctx =>
-  ctx.reply('👋 Rowan Elliss Portfolio Bot is active!\n\nVisitor alerts will be sent here.')
-);
-bot.launch();
-console.log('🤖 Telegram bot launched');
+  bot.start(ctx =>
+    ctx.reply('👋 Rowan Elliss Portfolio Bot is active!\n\nVisitor alerts will be sent here.')
+  );
 
-// ─── MongoDB ──────────────────────────────────────────────────
+  // Graceful launch
+  bot.launch().then(() => {
+    console.log('🤖 Telegram bot launched successfully');
+  }).catch(err => {
+    console.error('❌ Telegram bot launch error:', err.message);
+  });
+} catch (err) {
+  console.error('❌ Telegraf init error:', err.message);
+}
+
+// ─── MongoDB ────────────────────────────────────────────────────────────
 mongoose
-  .connect(process.env.MONGO_URI)
+  .connect(MONGO_URI, {
+    serverSelectionTimeoutMS: 10000,
+    socketTimeoutMS: 30000,
+  })
   .then(() => console.log('✅ MongoDB connected'))
   .catch(err => console.error('❌ MongoDB error:', err.message));
 
-// ═══════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════════
+//  HELPER — Send Telegram notification with retry
+// ═══════════════════════════════════════════════════════════════════════
+async function sendTelegramNotification(message) {
+  if (!bot) throw new Error('Bot not initialized');
+
+  // Retry up to 3 times
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      await bot.telegram.sendMessage(OWNER_ID, message, { parse_mode: 'Markdown' });
+      console.log(`[Notify] Message sent to owner (attempt ${attempt})`);
+      return true;
+    } catch (err) {
+      console.warn(`[Notify] Attempt ${attempt} failed: ${err.message}`);
+      if (attempt === 3) throw err;
+      await new Promise(r => setTimeout(r, 1000 * attempt));
+    }
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
 //  ROUTES
-// ═══════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════════
 
 // Health check
 app.get('/', (_req, res) => {
@@ -57,10 +137,12 @@ app.get('/', (_req, res) => {
     status:  'ok',
     service: 'Rowan Elliss Portfolio API',
     ts:      new Date().toISOString(),
+    ownerId: OWNER_ID ? '✅ configured' : '❌ missing',
+    mongo:   mongoose.connection.readyState === 1 ? '✅ connected' : '⚠️ disconnected',
   });
 });
 
-// ── POST /api/track ──────────────────────────────────────────
+// ── POST /api/track ──────────────────────────────────────────────────
 app.post('/api/track', async (req, res) => {
   try {
     const {
@@ -75,6 +157,13 @@ app.post('/api/track', async (req, res) => {
       pageUrl   = '',
     } = req.body;
 
+    // Get client IP (supports proxies like Render / Vercel)
+    const clientIp =
+      (req.headers['x-forwarded-for'] || '').split(',')[0].trim() ||
+      req.headers['x-real-ip'] ||
+      req.socket?.remoteAddress ||
+      null;
+
     // ① Save visitor to MongoDB
     const visitor = await Visitor.create({
       source,
@@ -86,44 +175,48 @@ app.post('/api/track', async (req, res) => {
       langCode:  langCode  || null,
       pageUrl,
       visitedAt: timestamp ? new Date(timestamp) : new Date(),
-      ip: (req.headers['x-forwarded-for'] || '').split(',')[0].trim()
-          || req.socket?.remoteAddress
-          || null,
+      ip:        clientIp,
     });
 
-    // ② Build Telegram notification message
+    // ② Build Telegram notification
     let msg = '';
     if (source === 'telegram' && tgId) {
+      // Visitor from inside Telegram
       const fullName = [firstName, lastName].filter(Boolean).join(' ') || 'Unknown';
       const handle   = username ? `@${username}` : 'no username';
       msg = [
         '👁 *New Telegram Visitor!*',
         '',
-        `📱 *Source:* Telegram`,
+        `📱 *Source:* Telegram WebApp`,
         `👤 *Name:* ${esc(fullName)}`,
-        `🆔 *ID:* \`${tgId}\``,
+        `🆔 *TG ID:* \`${tgId}\``,
         `🔗 *Username:* ${esc(handle)}`,
         `🌐 *Language:* ${langCode || 'unknown'}`,
         `🕐 *Time:* ${new Date().toUTCString()}`,
         `🔑 *DB ID:* \`${visitor._id}\``,
       ].join('\n');
     } else {
+      // Direct browser visitor — always notify
+      const agentShort = (userAgent || '').slice(0, 100);
+      const isMobile   = /mobile|android|iphone|ipad/i.test(userAgent);
+      const isChrome   = /chrome/i.test(userAgent) && !/edge/i.test(userAgent);
+      const browserHint= isMobile ? '📱 Mobile' : '🖥️ Desktop';
+
       msg = [
         '👁 *New Direct Visitor!*',
         '',
-        `🌐 *Source:* Browser / Direct`,
+        `🌐 *Source:* ${browserHint} Browser`,
         `🕐 *Time:* ${new Date().toUTCString()}`,
-        `📋 *Agent:* ${esc((userAgent || '').slice(0, 80))}`,
+        `🌍 *IP:* ${esc(clientIp || 'unknown')}`,
+        `📋 *Agent:* ${esc(agentShort)}`,
         `🔑 *DB ID:* \`${visitor._id}\``,
       ].join('\n');
     }
 
-    // ③ Send alert to owner
-    await bot.telegram.sendMessage(
-      process.env.OWNER_TELEGRAM_ID,
-      msg,
-      { parse_mode: 'Markdown' }
-    );
+    // ③ Send notification (non-blocking for response)
+    sendTelegramNotification(msg).catch(err => {
+      console.error('[Notify] Failed to send notification:', err.message);
+    });
 
     res.json({ success: true, id: visitor._id });
   } catch (err) {
@@ -133,14 +226,14 @@ app.post('/api/track', async (req, res) => {
   }
 });
 
-// ── GET /api/visitors ─────────────────────────────────────────
+// ── GET /api/visitors ────────────────────────────────────────────────
 app.get('/api/visitors', async (req, res) => {
-  if (req.query.token !== process.env.ADMIN_TOKEN)
+  if (req.query.token !== ADMIN_TKN)
     return res.status(401).json({ error: 'Unauthorized' });
 
   try {
     const limit = Math.min(parseInt(req.query.limit) || 50, 200);
-    const page  = Math.max(parseInt(req.query.page) || 1, 1);
+    const page  = Math.max(parseInt(req.query.page)  || 1, 1);
     const skip  = (page - 1) * limit;
 
     const [visitors, total] = await Promise.all([
@@ -154,9 +247,9 @@ app.get('/api/visitors', async (req, res) => {
   }
 });
 
-// ── GET /api/stats ────────────────────────────────────────────
+// ── GET /api/stats ───────────────────────────────────────────────────
 app.get('/api/stats', async (req, res) => {
-  if (req.query.token !== process.env.ADMIN_TOKEN)
+  if (req.query.token !== ADMIN_TKN)
     return res.status(401).json({ error: 'Unauthorized' });
 
   try {
@@ -178,32 +271,46 @@ app.get('/api/stats', async (req, res) => {
   }
 });
 
-// ═══════════════════════════════════════════════════════════════
-//  CRON — Keep Render free tier awake (ping every 5 minutes)
-// ═══════════════════════════════════════════════════════════════
-const SELF_URL = process.env.SELF_URL || `https://profilebackend-5mwr.onrender.com`;
+// ── GET /api/test-notify ─────────────────────────────────────────────
+// Test endpoint — call this to verify bot is working
+app.get('/api/test-notify', async (req, res) => {
+  if (req.query.token !== ADMIN_TKN)
+    return res.status(401).json({ error: 'Unauthorized' });
 
-cron.schedule('*/5 * * * *', async () => {
   try {
-    await axios.get(`${SELF_URL}/`);
-    console.log(`[Cron] Ping OK — ${new Date().toISOString()}`);
+    await sendTelegramNotification(
+      `🧪 *Test Notification*\n\nBackend is working!\nOwner ID: \`${OWNER_ID}\`\nTime: ${new Date().toUTCString()}`
+    );
+    res.json({ success: true, message: 'Test notification sent!', ownerId: OWNER_ID });
   } catch (err) {
-    console.warn('[Cron] Ping failed:', err.message);
+    res.status(500).json({ success: false, error: err.message, ownerId: OWNER_ID });
   }
 });
 
-// ═══════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════════
+//  CRON — Keep Render free tier awake (ping every 5 minutes)
+// ═══════════════════════════════════════════════════════════════════════
+cron.schedule('*/5 * * * *', async () => {
+  try {
+    await axios.get(`${SELF_URL}/`, { timeout: 10000 });
+    console.log(`[Cron] Keep-alive ping OK — ${new Date().toISOString()}`);
+  } catch (err) {
+    console.warn('[Cron] Keep-alive ping failed:', err.message);
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════════════
 //  HELPERS
-// ═══════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════════
 function esc(s = '') {
-  return s.replace(/[_*[\]()~`>#+=|{}.!\-]/g, '\\$&');
+  return String(s).replace(/[_*[\]()~`>#+=|{}.!\-]/g, '\\$&');
 }
 
-// ─── Start ────────────────────────────────────────────────────
+// ─── Start ──────────────────────────────────────────────────────────────
 app.listen(PORT, () =>
   console.log(`🚀 Server running on port ${PORT}`)
 );
 
-// ─── Graceful shutdown ────────────────────────────────────────
-process.once('SIGINT',  () => { bot.stop('SIGINT');  process.exit(0); });
-process.once('SIGTERM', () => { bot.stop('SIGTERM'); process.exit(0); });
+// ─── Graceful shutdown ──────────────────────────────────────────────────
+process.once('SIGINT',  () => { if (bot) bot.stop('SIGINT');  process.exit(0); });
+process.once('SIGTERM', () => { if (bot) bot.stop('SIGTERM'); process.exit(0); });

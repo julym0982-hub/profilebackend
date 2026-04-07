@@ -7,14 +7,14 @@ services:
     plan: free
     envVars:
       - key: BOT_TOKEN
-        sync: false          # Set manually in Render dashboard
-      - key: MONGO_URI
-        sync: false          # Set manually in Render dashboard
+        sync: false
       - key: OWNER_TELEGRAM_ID
-        sync: false          # Set manually in Render dashboard
+        sync: false
+      - key: MONGO_URI
+        sync: false
       - key: ADMIN_TOKEN
-        sync: false          # Set manually in Render dashboard
-      - key: FRONTEND_URL
-        sync: false          # Set manually in Render dashboard
+        sync: false
+      - key: SELF_URL
+        value: https://profilebackend-5mwr.onrender.com
       - key: NODE_ENV
         value: production

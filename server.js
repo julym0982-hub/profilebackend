@@ -1,57 +1,66 @@
 /**
  * profilebackend — server.js
  * Rowan Elliss Portfolio Backend
- * Stack: Node.js · Express · MongoDB (Mongoose) · Telegraf (Telegram Bot)
+ * Stack : Node.js · Express · MongoDB (Mongoose) · Telegraf · node-cron
  */
 
-const express    = require('express');
-const mongoose   = require('mongoose');
-const cors       = require('cors');
-const { Telegraf } = require('telegraf');
-const Visitor    = require('./models/Visitor');
+require('dotenv').config();
 
-// ── App Init ────────────────────────────────────────────────────
+const express     = require('express');
+const mongoose    = require('mongoose');
+const cors        = require('cors');
+const cron        = require('node-cron');
+const axios       = require('axios');
+const { Telegraf } = require('telegraf');
+
+const Visitor = require('./models/Visitor');
+
+// ─── App ────────────────────────────────────────────────────
 const app  = express();
 const PORT = process.env.PORT || 3000;
 
-// ── Middleware ──────────────────────────────────────────────────
+// ─── CORS ────────────────────────────────────────────────────
+// Allow ALL origins (Vercel static site, Telegram WebApp, etc.)
 app.use(cors({
-  origin: [
-    process.env.FRONTEND_URL || '*',  // Your Vercel domain, e.g. https://rowanelliss.vercel.app
-  ],
-  methods: ['GET', 'POST'],
+  origin: '*',
+  methods: ['GET', 'POST', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization'],
 }));
-app.use(express.json());
+app.options('*', cors()); // pre-flight for ALL routes
 
-// ── Telegram Bot Init ───────────────────────────────────────────
+// ─── Body parser ─────────────────────────────────────────────
+app.use(express.json({ limit: '1mb' }));
+app.use(express.urlencoded({ extended: true }));
+
+// ─── Telegram Bot ─────────────────────────────────────────────
 const bot = new Telegraf(process.env.BOT_TOKEN);
 
-// ── MongoDB Connect ─────────────────────────────────────────────
+bot.start(ctx =>
+  ctx.reply('👋 Rowan Elliss Portfolio Bot is active!\n\nVisitor alerts will be sent here.')
+);
+bot.launch();
+console.log('🤖 Telegram bot launched');
+
+// ─── MongoDB ──────────────────────────────────────────────────
 mongoose
-  .connect(process.env.MONGO_URI, {
-    useNewUrlParser:    true,
-    useUnifiedTopology: true,
-  })
+  .connect(process.env.MONGO_URI)
   .then(() => console.log('✅ MongoDB connected'))
-  .catch(err => console.error('❌ MongoDB error:', err));
+  .catch(err => console.error('❌ MongoDB error:', err.message));
 
 // ═══════════════════════════════════════════════════════════════
 //  ROUTES
 // ═══════════════════════════════════════════════════════════════
 
-// ── Health check ────────────────────────────────────────────────
+// Health check
 app.get('/', (_req, res) => {
-  res.json({ status: 'ok', message: 'Rowan Elliss Portfolio API' });
+  res.json({
+    status:  'ok',
+    service: 'Rowan Elliss Portfolio API',
+    ts:      new Date().toISOString(),
+  });
 });
 
-// ── POST /api/track ─────────────────────────────────────────────
-/**
- * Receives visitor data from the frontend.
- * Saves to MongoDB and sends a Telegram alert to the owner.
- *
- * Body shape:
- *  { source, userAgent, timestamp, tgId?, firstName?, lastName?, username?, langCode? }
- */
+// ── POST /api/track ──────────────────────────────────────────
 app.post('/api/track', async (req, res) => {
   try {
     const {
@@ -63,9 +72,10 @@ app.post('/api/track', async (req, res) => {
       lastName  = '',
       username  = '',
       langCode  = '',
+      pageUrl   = '',
     } = req.body;
 
-    // ── 1. Save to MongoDB ─────────────────────────────────────
+    // ① Save visitor to MongoDB
     const visitor = await Visitor.create({
       source,
       userAgent,
@@ -74,137 +84,126 @@ app.post('/api/track', async (req, res) => {
       lastName:  lastName  || null,
       username:  username  || null,
       langCode:  langCode  || null,
+      pageUrl,
       visitedAt: timestamp ? new Date(timestamp) : new Date(),
-      ip:        req.headers['x-forwarded-for'] || req.socket?.remoteAddress || null,
+      ip: (req.headers['x-forwarded-for'] || '').split(',')[0].trim()
+          || req.socket?.remoteAddress
+          || null,
     });
 
-    // ── 2. Build Telegram notification ────────────────────────
-    let message = '';
-
+    // ② Build Telegram notification message
+    let msg = '';
     if (source === 'telegram' && tgId) {
       const fullName = [firstName, lastName].filter(Boolean).join(' ') || 'Unknown';
       const handle   = username ? `@${username}` : 'no username';
-      message = [
-        '👁️ *New Portfolio Visitor!*',
+      msg = [
+        '👁 *New Telegram Visitor!*',
         '',
         `📱 *Source:* Telegram`,
-        `👤 *Name:* ${escapeMarkdown(fullName)}`,
-        `🆔 *Telegram ID:* \`${tgId}\``,
-        `🔗 *Username:* ${escapeMarkdown(handle)}`,
+        `👤 *Name:* ${esc(fullName)}`,
+        `🆔 *ID:* \`${tgId}\``,
+        `🔗 *Username:* ${esc(handle)}`,
         `🌐 *Language:* ${langCode || 'unknown'}`,
         `🕐 *Time:* ${new Date().toUTCString()}`,
-        '',
-        `🗄️ *DB Record ID:* \`${visitor._id}\``,
+        `🔑 *DB ID:* \`${visitor._id}\``,
       ].join('\n');
     } else {
-      message = [
-        '👁️ *New Portfolio Visitor!*',
+      msg = [
+        '👁 *New Direct Visitor!*',
         '',
-        `🌐 *Source:* Direct / Browser`,
+        `🌐 *Source:* Browser / Direct`,
         `🕐 *Time:* ${new Date().toUTCString()}`,
-        `📋 *Agent:* ${escapeMarkdown(userAgent.slice(0, 80))}`,
-        '',
-        `🗄️ *DB Record ID:* \`${visitor._id}\``,
+        `📋 *Agent:* ${esc((userAgent || '').slice(0, 80))}`,
+        `🔑 *DB ID:* \`${visitor._id}\``,
       ].join('\n');
     }
 
-    // ── 3. Send to owner via Telegram Bot ─────────────────────
+    // ③ Send alert to owner
     await bot.telegram.sendMessage(
       process.env.OWNER_TELEGRAM_ID,
-      message,
+      msg,
       { parse_mode: 'Markdown' }
     );
 
     res.json({ success: true, id: visitor._id });
   } catch (err) {
-    console.error('[/api/track] Error:', err.message);
-    // Still 200 — never break the frontend experience
+    console.error('[/api/track]', err.message);
+    // Always 200 — never break the frontend
     res.json({ success: false, error: err.message });
   }
 });
 
-// ── GET /api/visitors ──────────────────────────────────────────
-/**
- * Returns visitor history (protected by simple token auth).
- * Usage: GET /api/visitors?token=YOUR_ADMIN_TOKEN&limit=50
- */
+// ── GET /api/visitors ─────────────────────────────────────────
 app.get('/api/visitors', async (req, res) => {
-  const { token, limit = 50, page = 1 } = req.query;
-
-  if (token !== process.env.ADMIN_TOKEN) {
+  if (req.query.token !== process.env.ADMIN_TOKEN)
     return res.status(401).json({ error: 'Unauthorized' });
-  }
 
   try {
-    const perPage = Math.min(parseInt(limit), 200);
-    const skip    = (parseInt(page) - 1) * perPage;
+    const limit = Math.min(parseInt(req.query.limit) || 50, 200);
+    const page  = Math.max(parseInt(req.query.page) || 1, 1);
+    const skip  = (page - 1) * limit;
 
     const [visitors, total] = await Promise.all([
-      Visitor.find().sort({ visitedAt: -1 }).skip(skip).limit(perPage),
+      Visitor.find().sort({ visitedAt: -1 }).skip(skip).limit(limit),
       Visitor.countDocuments(),
     ]);
 
-    res.json({
-      total,
-      page:    parseInt(page),
-      perPage,
-      visitors,
-    });
+    res.json({ total, page, limit, visitors });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-// ── GET /api/stats ─────────────────────────────────────────────
+// ── GET /api/stats ────────────────────────────────────────────
 app.get('/api/stats', async (req, res) => {
-  const { token } = req.query;
-
-  if (token !== process.env.ADMIN_TOKEN) {
+  if (req.query.token !== process.env.ADMIN_TOKEN)
     return res.status(401).json({ error: 'Unauthorized' });
-  }
 
   try {
-    const [total, fromTelegram, fromDirect] = await Promise.all([
+    const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
+    const [total, fromTg, fromDirect, daily] = await Promise.all([
       Visitor.countDocuments(),
       Visitor.countDocuments({ source: 'telegram' }),
       Visitor.countDocuments({ source: 'direct' }),
+      Visitor.aggregate([
+        { $match: { visitedAt: { $gte: sevenDaysAgo } } },
+        { $group: { _id: { $dateToString: { format: '%Y-%m-%d', date: '$visitedAt' } }, count: { $sum: 1 } } },
+        { $sort: { _id: 1 } },
+      ]),
     ]);
 
-    // Last 7 days per day
-    const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
-    const daily = await Visitor.aggregate([
-      { $match: { visitedAt: { $gte: sevenDaysAgo } } },
-      {
-        $group: {
-          _id: { $dateToString: { format: '%Y-%m-%d', date: '$visitedAt' } },
-          count: { $sum: 1 },
-        },
-      },
-      { $sort: { _id: 1 } },
-    ]);
-
-    res.json({ total, fromTelegram, fromDirect, daily });
+    res.json({ total, fromTelegram: fromTg, fromDirect, daily });
   } catch (err) {
     res.status(500).json({ error: err.message });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════
+//  CRON — Keep Render free tier awake (ping every 5 minutes)
+// ═══════════════════════════════════════════════════════════════
+const SELF_URL = process.env.SELF_URL || `https://profilebackend-5mwr.onrender.com`;
+
+cron.schedule('*/5 * * * *', async () => {
+  try {
+    await axios.get(`${SELF_URL}/`);
+    console.log(`[Cron] Ping OK — ${new Date().toISOString()}`);
+  } catch (err) {
+    console.warn('[Cron] Ping failed:', err.message);
   }
 });
 
 // ═══════════════════════════════════════════════════════════════
 //  HELPERS
 // ═══════════════════════════════════════════════════════════════
-
-/** Escape Markdown special chars for Telegram */
-function escapeMarkdown(str = '') {
-  return str.replace(/[_*[\]()~`>#+=|{}.!-]/g, '\\$&');
+function esc(s = '') {
+  return s.replace(/[_*[\]()~`>#+=|{}.!\-]/g, '\\$&');
 }
 
-// ── Telegram bot /start (optional) ────────────────────────────
-bot.start(ctx => ctx.reply('👋 Rowan Elliss Portfolio Bot is running!'));
+// ─── Start ────────────────────────────────────────────────────
+app.listen(PORT, () =>
+  console.log(`🚀 Server running on port ${PORT}`)
+);
 
-// ── Launch ─────────────────────────────────────────────────────
-bot.launch();
-app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
-
-// ── Graceful shutdown ──────────────────────────────────────────
+// ─── Graceful shutdown ────────────────────────────────────────
 process.once('SIGINT',  () => { bot.stop('SIGINT');  process.exit(0); });
 process.once('SIGTERM', () => { bot.stop('SIGTERM'); process.exit(0); });

@@ -242,6 +242,52 @@ app.post('/api/track', async (req, res) => {
   }
 });
 
+
+// ── POST /api/contact ────────────────────────────────────────────────
+// Receives contact form submissions and forwards to admin via Telegram bot
+app.post('/api/contact', async (req, res) => {
+  try {
+    const {
+      name    = 'Unknown',
+      email   = 'No email',
+      subject = 'No subject',
+      message = '',
+    } = req.body;
+
+    if (!message || message.trim().length < 2) {
+      return res.status(400).json({ success: false, error: 'Message is required' });
+    }
+
+    // Get sender IP
+    const clientIp =
+      (req.headers['x-forwarded-for'] || '').split(',')[0].trim() ||
+      req.headers['x-real-ip'] ||
+      req.socket?.remoteAddress ||
+      'unknown';
+
+    // Build Telegram message for admin
+    const msg = [
+      '📩 *New Portfolio Message!*',
+      '',
+      `👤 *Name:*    ${esc(name)}`,
+      `📧 *Email:*   ${esc(email)}`,
+      `📌 *Subject:* ${esc(subject)}`,
+      `🌍 *IP:*      ${esc(clientIp)}`,
+      `🕐 *Time:*    ${new Date().toUTCString()}`,
+      '',
+      '💬 *Message:*',
+      esc(message.slice(0, 3000)),
+    ].join('\n');
+
+    await sendTelegramNotification(msg);
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error('[/api/contact]', err.message);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
 // ── GET /api/visitors ────────────────────────────────────────────────
 app.get('/api/visitors', async (req, res) => {
   if (req.query.token !== ADMIN_TKN)

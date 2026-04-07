@@ -142,6 +142,22 @@ app.get('/', (_req, res) => {
   });
 });
 
+
+// ── GET /api/profile ────────────────────────────────────────────────
+// Returns the portfolio owner's profile image as base64
+// Used by the frontend to dynamically load the profile picture
+app.get('/api/profile', (_req, res) => {
+  const fs   = require('fs');
+  const path = require('path');
+
+  const imgPath = path.join(__dirname, 'assets', 'profile.jpg');
+  if (!fs.existsSync(imgPath)) {
+    return res.status(404).json({ error: 'Profile image not found' });
+  }
+  const b64 = fs.readFileSync(imgPath).toString('base64');
+  res.json({ image: `data:image/jpeg;base64,${b64}` });
+});
+
 // ── POST /api/track ──────────────────────────────────────────────────
 app.post('/api/track', async (req, res) => {
   try {
